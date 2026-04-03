@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
 
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 /* =========================
    Utils / Math
 ========================= */
@@ -8,6 +9,23 @@ function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
 function dist3(a,b){
   const dx=a.x-b.x, dy=a.y-b.y, dz=(a.z||0)-(b.z||0);
   return Math.sqrt(dx*dx+dy*dy+dz*dz);
+}
+function dist2(a,b){
+  const dx=a.x-b.x, dy=a.y-b.y;
+  return Math.sqrt(dx*dx+dy*dy);
+}
+
+function computeHandScale(lm){
+  const w = dist2(lm[5], lm[17]);  // ширина ладони
+  const h = dist2(lm[0], lm[9]);   // высота ладони
+  return Math.max(w, h, 1e-6);
+}
+
+function computeQuality(lm){
+  const w = dist2(lm[5], lm[17]);
+  const h = dist2(lm[0], lm[9]);
+  const area = w*h;
+  return clamp(area * 40.0, 0, 1);
 }
 
 /* =========================
@@ -29,6 +47,22 @@ class EMA {
       this.value[i] = this.alpha*cur01[i] + (1-this.alpha)*this.value[i];
     }
     return this.value.slice();
+  }
+}
+class EMA1 {
+  constructor(alpha=0.35){
+    this.alpha = alpha;
+    this.v = 0;
+    this.init = false;
+  }
+  update(x){
+    if(!this.init){
+      this.v = x;
+      this.init = true;
+      return this.v;
+    }
+    this.v = this.alpha*x + (1-this.alpha)*this.v;
+    return this.v;
   }
 }
 
@@ -106,6 +140,11 @@ class HandState{
     this.indexTip = landmarks[8];
     this.palmCenter = this.computePalmCenter();
     this.pinchDistance = this.dist3(this.thumbTip, this.indexTip);
+    this.handScale = computeHandScale(landmarks);
+this.pinchRaw2D = dist2(this.thumbTip, this.indexTip);
+this.pinchNorm = this.pinchRaw2D / this.handScale;
+this.quality = computeQuality(landmarks);
+
   }
 
   dist3(a,b){
@@ -186,14 +225,20 @@ class InteractionEngine {
     this.prevPalm = new Map();    // handId -> {x,y}
     this.dragEma = new Map();     // handId -> EMA2
 
-    this.PINCH_ENTER = 0.035;
-    this.PINCH_EXIT  = 0.045;
+this.PINCH_ENTER_N = 0.42;
+this.PINCH_EXIT_N  = 0.52;
+
+this.pinchEma = new Map();
+
     this.DEADZONE = 0.0015;
   }
   ensure(handId){
     if(!this.fsms.has(handId)) this.fsms.set(handId, new GestureFSM(5,3));
     if(!this.pinch.has(handId)) this.pinch.set(handId,false);
     if(!this.dragEma.has(handId)) this.dragEma.set(handId, new EMA2(0.35));
+    if(!this.pinchEma.has(handId))
+  this.pinchEma.set(handId, new EMA1(0.35));
+
   }
   isPinch(handId){ return !!this.pinch.get(handId); }
 
@@ -203,15 +248,25 @@ class InteractionEngine {
     const pinchActive = this.pinch.get(handId);
 
     // PINCH hysteresis
-    if(!pinchActive && state.pinchDistance < this.PINCH_ENTER){
-      this.pinch.set(handId,true);
-      this.prevPalm.set(handId, {x:state.palmCenter.x, y:state.palmCenter.y});
-      events.push({type:"START", name:"PINCH"});
-    } else if(pinchActive && state.pinchDistance > this.PINCH_EXIT){
-      this.pinch.set(handId,false);
-      this.prevPalm.delete(handId);
-      events.push({type:"END", name:"PINCH"});
-    }
+const pinchSmoothed = this.pinchEma.get(handId).update(state.pinchNorm);
+const q = state.quality;
+
+// адаптивные пороги
+const enter = this.PINCH_ENTER_N + (1 - q) * 0.1;
+const exit  = this.PINCH_EXIT_N  + (1 - q) * 0.1;
+
+// PINCH hysteresis
+if(!pinchActive && pinchSmoothed < enter){
+  this.pinch.set(handId,true);
+  this.prevPalm.set(handId, {x:state.palmCenter.x, y:state.palmCenter.y});
+  events.push({type:"START", name:"PINCH"});
+}
+else if(pinchActive && pinchSmoothed > exit){
+  this.pinch.set(handId,false);
+  this.prevPalm.delete(handId);
+  events.push({type:"END", name:"PINCH"});
+}
+
 
     // DRAG while pinch
     if(this.pinch.get(handId)){
@@ -306,6 +361,22 @@ this.lastFrameTime = performance.now();
       this.renderer.setSize(window.innerWidth, window.innerHeight);
     });
     // ================= TWO HAND =================
+    // ================= TWO HAND (3D tilt) =================
+this.isDual = false;
+
+this.baseDistance = 0;
+this.baseScale = 1;
+
+this.baseMid = new THREE.Vector3();
+this.baseMeshPos = new THREE.Vector3();
+
+this.baseVec3 = new THREE.Vector3();
+this.baseQuat = new THREE.Quaternion();
+
+this.basePalmZ0 = 0;
+this.basePalmZ1 = 0;
+this.zGain = 1.2; // тюнинг: 0.6..2.0 (чем больше — тем сильнее tilt)
+
 this.isDual = false;
 this.baseDistance = 0;
 this.baseScale = 1;
@@ -548,48 +619,65 @@ obj.mesh.position.add(move);
 updateTwoHand(palmA, palmB){
 
   if(!this.selectedObject) return;
-  this.selectedObject.velocity.set(0,0,0);
-
 
   const mesh = this.selectedObject.mesh;
 
+  // XY берём как раньше (проекция на плоскость на текущем Z объекта)
   const posA = this.palmToWorldOnPlane(palmA, mesh.position.z);
   const posB = this.palmToWorldOnPlane(palmB, mesh.position.z);
-
   if(!posA || !posB) return;
 
-  const currentDistance = posA.distanceTo(posB);
-  const currentAngle = Math.atan2(
-    posB.y - posA.y,
-    posB.x - posA.x
-  );
+  // Добавляем "настоящий 3D" через MediaPipe z (относительная глубина)
+  // Важно: в MediaPipe z часто отрицательный ближе к камере.
+  const zA = (palmA.z - this.basePalmZ0) * this.zGain;
+  const zB = (palmB.z - this.basePalmZ1) * this.zGain;
+
+  const pA = posA.clone(); pA.z += zA;
+  const pB = posB.clone(); pB.z += zB;
+
+  const curMid = pA.clone().add(pB).multiplyScalar(0.5);
+  const curVec3 = pB.clone().sub(pA); // 3D вектор между руками
+
+  const curDist = curVec3.length();
+  if(curDist < 1e-6) return;
 
   if(!this.isDual){
     this.isDual = true;
-    this.baseDistance = currentDistance;
+
+    // базовые значения
+    this.baseDistance = curDist;
     this.baseScale = mesh.scale.x;
-    this.baseAngle = currentAngle;
-    this.baseRotation = mesh.rotation.z;
+
+    this.baseMid.copy(curMid);
+    this.baseMeshPos.copy(mesh.position);
+
+    this.baseVec3.copy(curVec3).normalize();
+    this.baseQuat.copy(mesh.quaternion);
+
+    this.basePalmZ0 = palmA.z;
+    this.basePalmZ1 = palmB.z;
+
     return;
   }
 
-const delta = currentDistance - this.baseDistance;
+  // ========== 1) POSITION (midpoint translate) ==========
+  const deltaMid = curMid.clone().sub(this.baseMid);
+  mesh.position.copy(this.baseMeshPos).add(deltaMid);
 
-// deadzone чтобы не дрожало
-if(Math.abs(delta) < 0.01) return;
+  // ========== 2) SCALE ==========
+  const scaleFactor = curDist / this.baseDistance;
+  const newScale = clamp(this.baseScale * scaleFactor, 0.3, 3.0);
+  mesh.scale.set(newScale, newScale, newScale);
 
-// линейный масштаб (а не относительный)
-const scaleSpeed = 2.0;
-let newScale = this.baseScale + delta * scaleSpeed;
+  // ========== 3) ROTATION (Real 3D tilt via quaternion) ==========
+  const curDir = curVec3.clone().normalize();
 
-newScale = clamp(newScale, 0.3, 3.0);
+  const qDelta = new THREE.Quaternion().setFromUnitVectors(this.baseVec3, curDir);
 
-mesh.scale.set(newScale, newScale, newScale);
-
-
-  const angleDelta = currentAngle - this.baseAngle;
-  mesh.rotation.z = this.baseRotation + angleDelta;
+  // итоговый поворот: qDelta * baseQuat
+  mesh.quaternion.copy(qDelta).multiply(this.baseQuat);
 }
+
 
 endTwoHand(){
   this.isDual = false;
@@ -696,7 +784,7 @@ if(interaction.isPinch(i)){
     const analyzer = ensureAnalyzer(i);
     const stable = analyzer.update(handLms, handed);
     const gesture = gestureDetector.detect(stable);
-    if(gesture === "PALM"){
+    if(gesture === "FIST"){
 
 if(!ar._spawnTimer){
   ar._spawnTimer = {};
@@ -758,10 +846,12 @@ for(const ev of events){
 }
 
 
-    if(interaction.isPinch(i) && ar.isGrabbed){
-      ar.updateGrab(state.palmCenter);
-      ar.updateZoomZ(state.pinchDistance);
-    }
+if(!ar.isDual && interaction.isPinch(i) && ar.isGrabbed){
+  ar.updateGrab(state.palmCenter);
+  ar.updateZoomZ(state.pinchDistance);
+}
+
+
 
 
     statuses.push(
